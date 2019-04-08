@@ -2,8 +2,7 @@
 
 module Recaptcha
   module ClientHelper
-    # Your public API can be specified in the +options+ hash or preferably
-    # using the Configuration.
+    # reCAPTCHA v2 Checkbox
     def recaptcha_tags(options = {})
       if options.key?(:stoken)
         raise(RecaptchaError, "Secure Token is deprecated. Please remove 'stoken' from your calls to recaptcha_tags.")
@@ -46,11 +45,16 @@ module Recaptcha
 
       html.respond_to?(:html_safe) ? html.html_safe : html
     end
+    alias_method :recaptcha_v2_tags, :recaptcha_tags
+    alias_method :recaptcha_v2_checkbox, :recaptcha_tags
 
-    # Invisible reCAPTCHA implementation
+    # reCAPTCHA v2 Invisible
     def invisible_recaptcha_tags(options = {})
-      options = {callback: 'invisibleRecaptchaSubmit', ui: :button}.merge options
-      text = options.delete(:text)
+      options = {
+        callback: 'invisibleRecaptchaSubmit',
+        ui: :button
+      }.merge options
+      text = options.delete(:text) || 'Submit'
       html, tag_attributes = Recaptcha::ClientHelper.recaptcha_components(options)
       html << recaptcha_default_callback(options) if recaptcha_default_callback_required?(options)
       case options[:ui]
@@ -65,6 +69,40 @@ module Recaptcha
       end
       html.respond_to?(:html_safe) ? html.html_safe : html
     end
+    alias_method :recaptcha_v2_invisible, :invisible_recaptcha_tags
+
+    # reCAPTCHA v3
+    def recaptcha_v3(options = {})
+      action = options.delete(:action) || raise(Recaptcha::RecaptchaError, 'action is required')
+      site_key = options.delete(:site_key)
+      site_key ||= Recaptcha.configuration.site_key_v3!
+      id   = options.delete(:id)   || "g-recaptcha-response-" + action.to_s.dasherize
+      name = options.delete(:name) || "g-recaptcha-response[#{action}]"
+      options[:render] = site_key
+      options[:script_async] ||= false
+      options[:script_defer] ||= false
+      element = options.delete(:element)
+      element = element == false ? false : :input
+      if element == :input
+        callback = options.delete(:callback) || recaptcha_v3_default_callback_name
+      end
+
+      html, tag_attributes = Recaptcha::ClientHelper.recaptcha_components(options)
+      if recaptcha_v3_inline_script?(options)
+        html << recaptcha_v3_inline_script(site_key, action, callback, id, options)
+      end
+      case element
+      when :input
+        html << %(<input type="hidden" name="#{name}" id="#{id}" #{tag_attributes}/>\n)
+      when false
+        # No tag
+        nil
+      else
+        raise(RecaptchaError, "ReCAPTCHA element `#{options[:element]}` is not valid.")
+      end
+      html.respond_to?(:html_safe) ? html.html_safe : html
+    end
+    alias_method :recaptcha_v3_tags, :recaptcha_v3
 
     def self.recaptcha_components(options = {})
       html = +''
@@ -80,8 +118,10 @@ module Recaptcha
       hl = options.delete(:hl)
       onload = options.delete(:onload)
       render = options.delete(:render)
+      script_async = options.delete(:script_async)
+      script_defer = options.delete(:script_defer)
       nonce = options.delete(:nonce)
-      skip_script = (options.delete(:script) == false)
+      skip_script = (options.delete(:script) == false) || (options.delete(:external_script) == false)
       ui = options.delete(:ui)
 
       data_attribute_keys = [:badge, :theme, :type, :callback, :expired_callback, :error_callback, :size]
@@ -93,7 +133,7 @@ module Recaptcha
       end
 
       unless Recaptcha::Verify.skip?(env)
-        site_key ||= Recaptcha.configuration.site_key!
+        site_key ||= Recaptcha.configuration.site_key_v2!
         script_url = Recaptcha.configuration.api_server_url
         query_params = hash_to_query(
           hl: hl,
@@ -101,14 +141,16 @@ module Recaptcha
           render: render
         )
         script_url += "?#{query_params}" unless query_params.empty?
+        async_attr = "async" if script_async != false
+        defer_attr = "defer" if script_defer != false
         nonce_attr = " nonce='#{nonce}'" if nonce
-        html << %(<script src="#{script_url}" async defer#{nonce_attr}></script>\n) unless skip_script
+        html << %(<script src="#{script_url}" #{async_attr} #{defer_attr} #{nonce_attr}></script>\n) unless skip_script
         fallback_uri = %(#{script_url.chomp(".js")}/fallback?k=#{site_key})
         attributes["data-sitekey"] = site_key
         attributes.merge! data_attributes
       end
 
-      # Append whatever that's left of options to be attributes on the tag.
+      # The remaining options will be added as attributes on the tag.
       attributes["class"] = "g-recaptcha #{class_attribute}"
       tag_attributes = attributes.merge(options).map { |k, v| %(#{k}="#{v}") }.join(" ")
 
@@ -117,6 +159,9 @@ module Recaptcha
 
     private
 
+    # Default callback used by invisible_recaptcha_tags
+    # Can be skipped by passing script: false, inline_script: false, or a value for callback other
+    # than 'invisibleRecaptchaSubmit'.
     def recaptcha_default_callback(options = {})
       nonce = options[:nonce]
       nonce_attr = " nonce='#{nonce}'" if nonce
@@ -147,7 +192,51 @@ module Recaptcha
     def recaptcha_default_callback_required?(options)
       options[:callback] == 'invisibleRecaptchaSubmit' &&
       !Recaptcha::Verify.skip?(options[:env]) &&
-      options[:script] != false
+      (options[:script] != false) &&
+      (options[:inline_script] != false)
+    end
+
+    def recaptcha_v3_inline_script(site_key, action, callback, id, options = {})
+      nonce = options[:nonce]
+      nonce_attr = " nonce='#{nonce}'" if nonce
+
+      <<-HTML
+        <script#{nonce_attr}>
+          grecaptcha.ready(function() {
+            grecaptcha.execute('#{site_key}', {action: '#{action}'}).then(function(token) {
+              #{callback}('#{id}', token)
+            });
+          });
+          #{recaptcha_v3_default_callback(callback) if recaptcha_v3_default_callback?(callback, options)}
+        </script>
+      HTML
+    end
+
+    def recaptcha_v3_inline_script?(options)
+      !Recaptcha::Verify.skip?(options[:env]) &&
+      (options[:script] != false) &&
+      (options[:inline_script] != false)
+    end
+
+    def recaptcha_v3_default_callback(callback)
+      <<-HTML
+          var #{callback} = function (id, token) {
+            var element = document.getElementById(id);
+            element.value = token;
+          }
+        </script>
+      HTML
+    end
+
+    def recaptcha_v3_default_callback?(callback, options)
+      callback == recaptcha_v3_default_callback_name &&
+      !Recaptcha::Verify.skip?(options[:env]) &&
+      (options[:script] != false) &&
+      (options[:inline_script] != false)
+    end
+
+    def recaptcha_v3_default_callback_name
+      'setInputWithRecaptchaResponseToken'
     end
 
     private_class_method def self.hash_to_query(hash)
